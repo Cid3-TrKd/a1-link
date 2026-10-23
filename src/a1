@@ -1,0 +1,329 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# a1 — link this Termux to A1-143.
+#
+# The phone runs the opencode TUI (linux-arm64-musl, inside a proot Alpine
+# rootfs) as a *client*, and talks to the A1-143 server over the internet.
+# Sessions, plugins, memory and this conversation all live on the server, so the
+# phone is a terminal — not a second, empty agent.
+#
+#   a1                  open the TUI against the server
+#   a1 local            open the TUI with no server (phone-local)
+#   a1 pair [URL]       store address + password (one time)
+#   a1 status           what is configured, and whether it answers
+#   a1 bootstrap        install the Alpine rootfs + opencode binary
+#
+# Config lives in ~/.config/a1-link/config, mode 0600. It contains a password.
+set -u
+
+A1_VERSION="1.0.0"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+HOME="${HOME:-/data/data/com.termux/files/home}"
+
+CONF_DIR="$HOME/.config/a1-link"
+CONF="$CONF_DIR/config"
+
+# The published, current address of the A1-143 server. Only the *address* is
+# baked in, never the password: this file is public on GitHub. If the tunnel
+# moves, this file is updated and every phone follows it.
+DEFAULT_URL="https://ce9a55e28e9dea79.pzomxflhgs3x.opentunnel.xyz"
+PUBLISHED_URL="https://raw.githubusercontent.com/Cid3-TrKd/a1-link/main/current-url.txt"
+
+A1_SERVER_URL=""
+A1_SERVER_PASSWORD=""
+A1_OPENCODE_VERSION=""
+
+A1_ROOT="${A1_ROOT:-$HOME/a1-oc/alpine}"     # host path of the Alpine rootfs
+A1_BIN="${A1_BIN:-$HOME/a1-oc/opencode}"     # host path of the arm64-musl binary
+
+[ -f "$CONF" ] && . "$CONF"
+
+ALPINE_VER="3.24.3"
+ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-minirootfs-${ALPINE_VER}-aarch64.tar.gz"
+NPM_SCOPE="@opencode"
+
+die()  { printf 'a1: %s\n' "$*" >&2; exit 1; }
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'a1: %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    cat <<EOF
+a1 $A1_VERSION — link this Termux to A1-143
+
+  a1                     open the terminal (talks to the server)
+  a1 local [args...]     open the terminal without a server (phone-local)
+  a1 pair [URL]          store the server address + password (one time)
+  a1 status              what is configured, and whether it answers
+  a1 api GET /api/info   raw client call against the configured server
+  a1 bootstrap           install the Alpine rootfs and opencode binary
+  a1 version             print versions
+  a1 help                this text
+
+Config: $CONF (mode 0600)
+EOF
+}
+
+# ---------------------------------------------------------------- config file
+
+save_conf() {
+    local url="$1" pw="$2" ver="${3:-}"
+    case "$url$pw$ver" in
+        *"'"*) die "refusing to store a value containing a single quote" ;;
+    esac
+    umask 077
+    mkdir -p "$CONF_DIR" || die "cannot create $CONF_DIR"
+    chmod 700 "$CONF_DIR"
+    {
+        printf '# a1-link — contains a server password. Keep it 0600.\n'
+        printf "A1_SERVER_URL='%s'\n" "$url"
+        printf "A1_SERVER_PASSWORD='%s'\n" "$pw"
+        [ -n "$ver" ] && printf "A1_OPENCODE_VERSION='%s'\n" "$ver"
+        printf "A1_ROOT='%s'\n" "$A1_ROOT"
+        printf "A1_BIN='%s'\n" "$A1_BIN"
+    } > "$CONF" || die "cannot write $CONF"
+    chmod 600 "$CONF"
+}
+
+# {"version":"2.0.26",...} -> 2.0.26
+json_version() {
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+}
+
+api_ok() {
+    # $1 = url ; uses the configured password
+    curl -fsS -o /dev/null -m 12 -u "opencode:${A1_SERVER_PASSWORD:-}" \
+         "$1/api/info" 2>/dev/null
+}
+
+# --------------------------------------------------------------- the rootfs
+
+need_rootfs() {
+    [ -d "$A1_ROOT" ]  || die "no Alpine rootfs at $A1_ROOT — run: a1 bootstrap"
+    [ -x "$A1_BIN" ]   || die "no opencode binary at $A1_BIN — run: a1 bootstrap"
+}
+
+# Run a command inside the rootfs. The host binary is bound to
+# /usr/local/bin/opencode, so exactly one copy of the 220 MB file exists.
+# Env is inherited — OPENCODE_PASSWORD reaches the client without ever
+# appearing in a command line.
+run_in_root() {
+    need_rootfs
+    (
+        cd "$A1_ROOT" || exit 1
+        exec proot -r . -0 \
+            -b /dev -b /proc -b /sys \
+            -b "$A1_BIN:/usr/local/bin/opencode" \
+            -w /root /bin/sh -c '
+                export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                export HOME=/root
+                exec "$@"
+            ' sh "$@"
+    )
+}
+
+# Which address to use. The saved one if it answers; otherwise the published
+# one, which is refreshed when the tunnel moves. Saves what it finds.
+pick_url() {
+    if [ -n "$A1_SERVER_URL" ] && api_ok "$A1_SERVER_URL"; then
+        printf '%s\n' "$A1_SERVER_URL"
+        return 0
+    fi
+    local pub
+    pub="$(curl -fsS -m 10 "$PUBLISHED_URL" 2>/dev/null | tr -d '[:space:]')"
+    case "$pub" in
+        http://*|https://*) ;;
+        *) pub="" ;;
+    esac
+    if [ -n "$pub" ] && [ "$pub" != "$A1_SERVER_URL" ] && api_ok "$pub"; then
+        warn "server moved; saving $pub"
+        save_conf "$pub" "$A1_SERVER_PASSWORD" "$A1_OPENCODE_VERSION"
+        A1_SERVER_URL="$pub"
+        printf '%s\n' "$pub"
+        return 0
+    fi
+    return 1
+}
+
+# ----------------------------------------------------------------- commands
+
+cmd_pair() {
+    local url="${1:-}" pw="${2:-}" info ver
+    have curl || die "curl is required (pkg install curl)"
+    if [ -z "$url" ]; then
+        printf 'Server URL [%s]: ' "$DEFAULT_URL"
+        read -r url || true
+    fi
+    url="${url:-$DEFAULT_URL}"
+    case "$url" in
+        http://*|https://*) ;;
+        *) die "URL must start with http:// or https://" ;;
+    esac
+    url="${url%/}"
+    if [ -z "$pw" ]; then
+        printf 'Password (not shown): '
+        read -r -s pw || true
+        printf '\n'
+    fi
+    [ -n "$pw" ] || die "no password given"
+
+    say "asking $url ..."
+    info="$(curl -fsS -m 25 -u "opencode:$pw" "$url/api/info" 2>&1)" \
+        || die "no answer with that password: $info"
+    ver="$(printf '%s' "$info" | json_version)"
+    save_conf "$url" "$pw" "$ver"
+    say "paired with $url (opencode ${ver:-?})"
+    say "saved to $CONF (0600)"
+    say "now run: a1"
+}
+
+cmd_status() {
+    say "a1            : $A1_VERSION"
+    say "config        : $CONF $( [ -f "$CONF" ] && echo present || echo MISSING )"
+    say "server url    : ${A1_SERVER_URL:-<unset>}"
+    if [ -n "${A1_SERVER_PASSWORD:-}" ]; then
+        say "password      : set (${#A1_SERVER_PASSWORD} chars)"
+    else
+        say "password      : <unset>"
+    fi
+    say "rootfs        : $A1_ROOT $( [ -d "$A1_ROOT" ] && echo present || echo MISSING )"
+    say "opencode bin  : $A1_BIN $( [ -x "$A1_BIN" ] && echo present || echo MISSING )"
+    if [ -x "$A1_BIN" ] && [ -d "$A1_ROOT" ]; then
+        say "client        : $(run_in_root opencode --version 2>&1 | tail -n1)"
+    fi
+    if [ -n "$A1_SERVER_URL" ]; then
+        local out code
+        out="$(curl -sS -m 20 -u "opencode:${A1_SERVER_PASSWORD:-}" \
+               -w '\n__CODE__%{http_code}' "$A1_SERVER_URL/api/info" 2>&1)"
+        code="${out##*__CODE__}"
+        out="${out%$'\n'__CODE__*}"
+        say "reachable     : HTTP $code"
+        [ -n "$out" ] && say "server says   : $(printf '%s' "$out" | head -c 200)"
+    fi
+    [ -n "${A1_OPENCODE_VERSION:-}" ] && say "server version: $A1_OPENCODE_VERSION"
+}
+
+cmd_api() {
+    [ $# -ge 1 ] || die "usage: a1 api GET /api/info"
+    [ -n "$A1_SERVER_URL" ] || die "not paired — run: a1 pair"
+    OPENCODE_PASSWORD="${A1_SERVER_PASSWORD:-}"; export OPENCODE_PASSWORD
+    run_in_root opencode api "$@" --server "$A1_SERVER_URL"
+}
+
+cmd_tui() {
+    local mode="$1"; shift
+    local url=""
+    if [ "$mode" = remote ]; then
+        [ -n "$A1_SERVER_URL" ] || die "not paired — run: a1 pair   (or: a1 local)"
+        url="$(pick_url)" || die "server unreachable at ${A1_SERVER_URL:-<unset>}
+  check the phone is online, or re-pair:  a1 pair"
+        OPENCODE_PASSWORD="${A1_SERVER_PASSWORD:-}"; export OPENCODE_PASSWORD
+    fi
+    need_rootfs
+    (
+        cd "$A1_ROOT" || exit 1
+        if [ "$mode" = remote ]; then
+            exec proot -r . -0 -b /dev -b /proc -b /sys \
+                -b "$A1_BIN:/usr/local/bin/opencode" \
+                -w /root /bin/sh -c '
+                    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                    export HOME=/root
+                    exec "$@"
+                ' sh opencode --server "$url" "$@"
+        else
+            exec proot -r . -0 -b /dev -b /proc -b /sys \
+                -b "$A1_BIN:/usr/local/bin/opencode" \
+                -w /root /bin/sh -c '
+                    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                    export HOME=/root
+                    exec "$@"
+                ' sh opencode "$@"
+        fi
+    )
+}
+
+need_tools() {
+    have curl  || die "curl is required (pkg install curl)"
+    have tar   || die "tar is required (pkg install tar)"
+    have proot || die "proot is required (pkg install proot)"
+}
+
+cmd_bootstrap() {
+    need_tools
+    mkdir -p "$(dirname "$A1_ROOT")" || die "cannot create $(dirname "$A1_ROOT")"
+
+    if [ ! -d "$A1_ROOT" ]; then
+        local tb="$HOME/a1-oc/alpine-minirootfs-${ALPINE_VER}-aarch64.tar.gz"
+        say "downloading Alpine ${ALPINE_VER} ..."
+        curl -fL --retry 2 -o "$tb" "$ALPINE_URL" || die "download failed"
+        mkdir -p "$A1_ROOT" || die "cannot create $A1_ROOT"
+        say "extracting (this takes a moment) ..."
+        # proot fakes the mknod calls a rootfs tarball contains; without it the
+        # extraction dies on /dev entries.
+        proot --link2symlink -0 tar -xzf "$tb" -C "$A1_ROOT" \
+            || die "extraction failed"
+        rm -f "$tb"
+    else
+        say "rootfs present: $A1_ROOT"
+    fi
+
+    # Alpine's minirootfs ships no resolv.conf, and without one nothing resolves
+    # inside the rootfs — which reads as "the network is broken".
+    if [ ! -s "$A1_ROOT/etc/resolv.conf" ]; then
+        printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$A1_ROOT/etc/resolv.conf" \
+            && say "wrote /etc/resolv.conf"
+    fi
+
+    if [ ! -x "$A1_BIN" ]; then
+        local ver="${A1_OPENCODE_VERSION:-}"
+        if [ -z "$ver" ]; then
+            ver="$(curl -fsSL -m 20 https://opencode.ai/update/api/latest/cli/npm 2>/dev/null | json_version)"
+        fi
+        [ -n "$ver" ] || die "cannot determine which opencode version to install"
+        local url="https://registry.npmjs.org/${NPM_SCOPE}/cli-linux-arm64-musl/-/cli-linux-arm64-musl-${ver}.tgz"
+        local tmp="$HOME/a1-oc/.opencode-${ver}.tgz"
+        say "downloading opencode ${ver} (linux-arm64-musl, ~200 MB) ..."
+        curl -fL --retry 2 -o "$tmp" "$url" || die "download failed"
+        rm -rf "$HOME/a1-oc/.unpack"
+        mkdir -p "$HOME/a1-oc/.unpack"
+        tar -xzf "$tmp" -C "$HOME/a1-oc/.unpack" package/bin/opencode \
+            || die "cannot extract the binary"
+        mv "$HOME/a1-oc/.unpack/package/bin/opencode" "$A1_BIN" \
+            || die "cannot install $A1_BIN"
+        chmod 755 "$A1_BIN"
+        rm -rf "$HOME/a1-oc/.unpack" "$tmp"
+    else
+        say "opencode present: $A1_BIN"
+    fi
+
+    say "checking ..."
+    run_in_root opencode --version || die "the binary does not run under proot here"
+    say "bootstrap done"
+}
+
+cmd_version() {
+    say "a1          $A1_VERSION"
+    if [ -d "$A1_ROOT" ] && [ -x "$A1_BIN" ]; then
+        say "opencode    $(run_in_root opencode --version 2>&1 | tail -n1)"
+    fi
+    if [ -n "${A1_OPENCODE_VERSION:-}" ]; then
+        say "server      $A1_OPENCODE_VERSION"
+    fi
+}
+
+main() {
+    local cmd="${1:-tui}"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        tui|"")             cmd_tui remote "$@" ;;
+        local)              cmd_tui local  "$@" ;;
+        pair)               cmd_pair "$@" ;;
+        status)             cmd_status ;;
+        api)                cmd_api "$@" ;;
+        bootstrap|update)   cmd_bootstrap ;;
+        version|-v|--version) cmd_version ;;
+        help|-h|--help)     usage ;;
+        *)                  usage; exit 1 ;;
+    esac
+}
+
+main "$@"
