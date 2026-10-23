@@ -22,15 +22,18 @@ In Termux:
 
 ```sh
 pkg install -y curl
-curl -fLO https://github.com/Cid3-TrKd/a1-link/releases/download/v1.0/a1-link_1.0.0_aarch64.deb
-pkg install -y ./a1-link_1.0.0_aarch64.deb
+curl -fLO https://github.com/Cid3-TrKd/a1-link/releases/latest/download/a1-link_aarch64.deb
+pkg install -y ./a1-link_aarch64.deb
 ```
+
+That URL always serves the newest release, so the command does not change when
+a version is bumped.
 
 If `pkg install` refuses a local file on your Termux build, `dpkg -i` is the
 same thing:
 
 ```sh
-dpkg -i a1-link_1.0.0_aarch64.deb
+dpkg -i a1-link_aarch64.deb
 ```
 
 Then, once:
@@ -88,7 +91,14 @@ which makes DNS fail and looks like a broken network).
 ## Rebuilding
 
 ```sh
-./build.sh          # -> dist/a1-link_1.0.0_aarch64.deb
+./build.sh          # -> dist/a1-link_1.0.1_aarch64.deb
+```
+
+Then copy it to the stable name the README links to:
+
+```sh
+cp dist/a1-link_1.0.1_aarch64.deb dist/a1-link_aarch64.deb
+gh release upload v1.0.1 dist/a1-link_1.0.1_aarch64.deb dist/a1-link_aarch64.deb --clobber
 ```
 
 The build has no dependencies beyond `dpkg-deb`, `tar` and `bash`.
