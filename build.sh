@@ -8,7 +8,7 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 NAME=a1-link
-VERSION=1.0.0
+VERSION=1.0.1
 ARCH=aarch64
 
 STAGE=$(mktemp -d)

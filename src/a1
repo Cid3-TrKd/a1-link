@@ -15,7 +15,7 @@
 # Config lives in ~/.config/a1-link/config, mode 0600. It contains a password.
 set -u
 
-A1_VERSION="1.0.0"
+A1_VERSION="1.0.1"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 HOME="${HOME:-/data/data/com.termux/files/home}"
 
@@ -150,9 +150,13 @@ cmd_pair() {
     local url="${1:-}" pw="${2:-}" info ver
     have curl || die "curl is required (pkg install curl)"
     if [ -z "$url" ]; then
-        printf 'Server URL [%s]: ' "$DEFAULT_URL"
+        printf 'Server URL\n  (press Enter to use %s)\n> ' "$DEFAULT_URL"
         read -r url || true
     fi
+    # People copy the default *including* the brackets it is displayed in.
+    # Strip them, and any stray whitespace, rather than failing on a URL that
+    # looks right on screen.
+    url="$(printf '%s' "$url" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\[//' -e 's/\]$//')"
     url="${url:-$DEFAULT_URL}"
     case "$url" in
         http://*|https://*) ;;
